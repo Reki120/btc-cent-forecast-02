@@ -1,4 +1,4 @@
-# btc-cent-forecast-01 — Bitcoin price 4 hours ahead
+# btc-cent-forecast-02 — Bitcoin price 4 hours ahead
 
 Entry for make.fun's "Forecast Bitcoin's price 4 hours ahead, 12 times
 over 48 hours" bounty ($250 in USDC, escrowed).
