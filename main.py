@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""btc-cent-forecast-01 entrypoint (Python 3.13, standard library only).
+"""btc-cent-forecast-02 entrypoint (Python 3.13, standard library only).
 
 Forecast: the median of the predictive distribution under absolute-error
 scoring. Bitcoin's 4-hour returns show a small, consistent mean reversion:
@@ -35,6 +35,9 @@ OUTPUT_DIR = os.environ.get("MAKEFUN_OUTPUT_DIR", "/output")
 MIN_PRICE = 0.00001
 MAX_PRICE = 9_999_999.99999
 HORIZON_MINUTES = 240
+# SHRINK 0.5: only half the last 4h move is taken back. Full reversion
+# (1.0) scored a touch better on the 115-checkpoint backtest but has
+# twice the variance on a 12-case final; 0.5 is the robust middle.
 SHRINK = 0.5
 
 
@@ -77,6 +80,8 @@ def main():
         markets = case.get("markets")
         if not isinstance(markets, list) or len(markets) != 1:
             raise ValueError(f"{name} does not hold exactly one market")
+        if case.get("horizon_minutes", HORIZON_MINUTES) != HORIZON_MINUTES:
+            raise ValueError(f"{name} has an unexpected horizon")
         guess = forecast(markets[0].get("prices"))
         out = {"forecasts": [{"case": case_id, "price": guess}]}
         with open(os.path.join(OUTPUT_DIR, case_id + ".out"), "w", encoding="utf-8") as fh:
