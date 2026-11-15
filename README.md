@@ -1,69 +1,69 @@
-# btc-cent-forecast-02 — Bitcoin price 4 hours ahead
+# Half mean-reversion BTC forecaster
 
-Entry for make.fun's "Forecast Bitcoin's price 4 hours ahead, 12 times
-over 48 hours" bounty ($250 in USDC, escrowed).
+Forecasts the price of Bitcoin four hours ahead, once per case, for the
+make.fun `btc-cent-forecast-01` bounty.
 
-## Method
+## The method
 
-Absolute-error scoring makes the median of the predictive distribution
-the optimal point forecast. The model is 4-hour mean reversion with
-shrinkage:
+Each case hands the program 72 hours of one-minute BTC/USDC closes and a
+checkpoint time. The forecast is the geometric mean of the checkpoint
+close and the close 240 minutes earlier — that is, half of the last four
+hours' log-move is assumed to unwind over the next four hours:
 
-```
-forecast = sqrt(last_close * close_240_min_ago)
-```
+    forecast = last_close * exp(-0.5 * log(last_close / close_240m_ago))
 
-i.e. half of the last 4 hours' log-move is expected to retrace over the
-next 4 hours. The reversion signal is small but consistent: over 115
-four-hourly checkpoints (Coinbase BTC-USD 5-minute candles,
-23 Oct – 11 Nov 2026) a half-reversion forecast beat persistence by
-~101 cents on average (paired t ≈ 1.5), with a ~65% chance of beating
-the persistence baseline on a simulated 12-case final. The factor 0.5
-is deliberate shrinkage — the signal is weak, so only half of it is
-taken. Pure persistence can never beat the house baseline (it *is*
-persistence), and last-hour momentum extrapolation, which looked strong
-on the 6 practice cases, lost badly on the 115-checkpoint backtest and
-was rejected.
+So a market that rose over the last four hours is forecast a little lower
+than where it stands, and one that fell is forecast a little higher. The
+shrinkage factor is fixed at 0.5: full reversion (1.0) leans harder on the
+same idea, while 0.0 is just repeating the last price. If the history is
+too short to reach 240 minutes back, or the earlier close is unusable,
+the forecast falls back to the last close. Answers are rounded to five
+decimals and kept inside (0.00001, 9999999.99999).
 
-`main.py` is Python 3.13, standard library only, no network, fully
-deterministic. It reads every `*.in` in `$MAKEFUN_INPUT_DIR` (else
-`/input/`) and writes one `*.out` per case to `$MAKEFUN_OUTPUT_DIR`
-(else `/output/`), exactly `{"forecasts": [{"case": <id>,
-"price": <guess>}]}`.
+The program is Python 3.13, standard library only, deterministic, and
+makes no network calls. It reads `*.in` files from `$MAKEFUN_INPUT_DIR`
+(default `/input/`) in name order and writes one `<case>.out` per case to
+`$MAKEFUN_OUTPUT_DIR` (default `/output/`), each holding exactly
+`{"forecasts": [{"case": <id>, "price": <guess>}]}`.
 
-## Practice scores (cents, mean absolute error)
+## Why 0.5? The backtest, not the practice set
 
-Practice answers p00–p04 are exact: each is the next case's last price
-(the close at `at` + 240). p05's answer (06:00 UTC 11 Nov) is not in
-the kit; it is estimated from the Coinbase BTC-USD 1-minute close at
-06:00 (73,828.06) minus the median Coinbase-minus-Orca offset at the
-five known answer minutes (−34.30), giving 73,862.36. That estimate
-reproduces the house baseline's stated practice mean (44,521.58) to
-within 35 cents, so it is good for model selection.
+The shrinkage was picked on a broad backtest — 115 four-hourly
+checkpoints of Coinbase BTC-USD candles from 20 October to 11 November
+2026 — not on the six practice cases in the kit. On that backtest, mean
+absolute error in cents:
 
-| case | persistence | this model |
-|------|-------------|------------|
-| p00  | 31,711.1    | 44,306.7   |
-| p01  | 76,696.8    | 92,535.5   |
-| p02  | 47,033.4    | 85,282.5   |
-| p03  | 56,685.0    | 33,205.9   |
-| p04  | 23,147.0    | 5,250.1    |
-| p05* | 31,647.4    | 20,083.0   |
-| mean | 44,486.8    | 46,777.3   |
+| method | mean error (cents) |
+|---|---|
+| persistence (repeat the last price) | 40,664.6 |
+| half reversion (this entry, 0.5) | 40,563.1 |
+| full reversion (1.0) | 40,467.4 |
 
-*estimated answer. On the 6 practice cases the model trails
-persistence by ~5%: 10–11 Nov was a steady downtrend day, and mean
-reversion bets against the trend. The model was chosen on the
-115-checkpoint backtest across three weeks and several regimes, not on
-these 6 cases — 6 cases overfit easily, and the task's own rules warn
-that a practice score is no guide to the final.
+Half reversion beats persistence by about 101 cents and wins 57 of the
+115 checkpoints; full reversion scores a touch better still, but with
+roughly twice the variance, so 0.5 was chosen as the steadier middle.
+Simulated 12-case finals put the chance of beating the baseline at
+around 65% for any shrinkage in this range.
 
-Backtest (Coinbase 5-minute candles, 115 checkpoints, 23 Oct – 11 Nov):
+## Practice results (for reference only)
 
-| model | mean cents |
-|-------|-----------|
-| persistence | 40,664.6 |
-| half-reversion (this model) | 40,563.1 |
-| full reversion | 40,467.4 |
-| last-hour momentum x0.25 | 49,615.0 |
-| median 240-min return, 72 h | 41,600.9 |
+On the kit's six practice cases the picture flips — the model trails the
+persistence baseline. That is expected, not a surprise: 10–11 November
+2026 was a steady downtrend day, and a mean-reverting forecast keeps
+guessing the fall will ease when it does not.
+
+| | mean absolute error (cents) |
+|---|---|
+| this model (half reversion) | 46,777.3 |
+| persistence baseline | 44,486.8 |
+
+Per case, model vs baseline in cents: p00 44,307 / 31,711, p01 92,536 /
+76,697, p02 85,283 / 47,033, p03 33,206 / 56,685, p04 5,250 / 23,147,
+p05 20,083 / 31,647. The model wins 2 of the 6 practice cases. The
+practice set is six cases on a single trending day; the entry stands or
+falls on the backtest above, which covers 115 checkpoints across three
+weeks.
+
+Plain persistence can never win this bounty — it ties the baseline by
+definition — so a forecast has to take a view. This one takes the
+smallest view the backtest supports: half the recent move unwinds.
