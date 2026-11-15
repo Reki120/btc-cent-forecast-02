@@ -1,92 +1,135 @@
 #!/usr/bin/env python3
-"""btc-cent-forecast-02 entrypoint (Python 3.13, standard library only).
+"""Bitcoin price, four hours ahead: a one-line forecaster.
 
-Forecast: the median of the predictive distribution under absolute-error
-scoring. Bitcoin's 4-hour returns show a small, consistent mean reversion:
-over 115 four-hourly checkpoints (Coinbase BTC-USD 5-minute candles,
-23 Oct - 11 Nov 2026) the next 4-hour return is slightly negatively
-correlated with the previous 4-hour return. The model therefore forecasts
-half of the last 4 hours' move to retrace:
+For every case file this script reads the minute-by-minute closes of
+BTC/USDC, looks at where the price stands at the checkpoint and where it
+stood four hours earlier, and answers with a single number: the price it
+expects four hours after the checkpoint.
 
-    forecast = last * exp(-0.5 * log(last / price_240_min_ago))
-             = sqrt(last * price_240_min_ago)
+The answer is deliberately boring. Markets that have drifted away from
+where they were tend, on average, to drift part of the way back, so the
+forecast splits the difference between "nothing changes" and "the whole
+move reverses": it takes the geometric mean of the checkpoint close and
+the close 240 minutes before it. In other words, half of the log-return
+over the last four hours is assumed to unwind over the next four.
 
-i.e. the geometric mean of the checkpoint price and the price 4 hours
-earlier. The factor 0.5 is shrinkage: the reversion signal is real but
-weak (paired t ~ 1.5 over 115 checkpoints, ~65% chance of beating the
-persistence baseline on a 12-case final), so only half of it is taken.
-Pure persistence (forecast = last) can never beat the house baseline,
-which is itself persistence; momentum extrapolation of the last hour
-looked strong on the 6 practice cases (a steady downtrend day) but lost
-badly on the 115-checkpoint backtest and was rejected.
+    forecast = last_close * exp(-0.5 * log(last_close / close_240m_ago))
 
-Deterministic: a pure function of the case's prices, no randomness, no
-network. Reads every *.in in the input directory, writes one *.out per
-case with exactly {"forecasts": [{"case": <id>, "price": <guess>}]}.
+That is the entire model. There is no fitted parameter beyond the fixed
+one-half, no look at the clock, no randomness, and no network access, so
+two runs over the same inputs produce byte-identical outputs.
+
+Usage: python3 main.py
+  reads  *.in  from $MAKEFUN_INPUT_DIR (default /input/)
+  writes <case>.out to $MAKEFUN_OUTPUT_DIR (default /output/)
 """
 
 import json
 import math
 import os
+import sys
+from pathlib import Path
 
-INPUT_DIR = os.environ.get("MAKEFUN_INPUT_DIR", "/input")
-OUTPUT_DIR = os.environ.get("MAKEFUN_OUTPUT_DIR", "/output")
+# How far back the reference close sits, in minutes.
+REFERENCE_LAG_MINUTES = 240
 
-MIN_PRICE = 0.00001
-MAX_PRICE = 9_999_999.99999
-HORIZON_MINUTES = 240
-# SHRINK 0.5: only half the last 4h move is taken back. Full reversion
-# (1.0) scored a touch better on the 115-checkpoint backtest but has
-# twice the variance on a 12-case final; 0.5 is the robust middle.
-SHRINK = 0.5
+# Fraction of the last four hours' log-move assumed to unwind.
+REVERSION_FRACTION = 0.5
 
+# A forecast is never allowed outside this band.
+LOWEST_ALLOWED_PRICE = 0.00001
+HIGHEST_ALLOWED_PRICE = 9999999.99999
 
-def price5(x):
-    """x kept on the grid's 5 decimals and inside the scorer's (0, 10M)."""
-    if not math.isfinite(x) or x <= 0:
-        raise ValueError("forecast is not a finite positive number")
-    return round(min(MAX_PRICE, max(MIN_PRICE, x)) * 1e5) / 1e5
+# Answers are quoted to five places after the point.
+DECIMAL_PLACES = 5
 
 
-def forecast(prices):
-    """Geometric mean of the last close and the close 240 minutes earlier.
+def pull_cases(folder):
+    """Collect every case file in `folder`, in filename order.
 
-    prices[-241] is the close 240 minutes before the checkpoint close
-    prices[-1] (one close a minute). Falls back to the last close when
-    the window is too short or the earlier close is unusable.
+    Returns a list of (case_id, closes) pairs. A case file must name a
+    240-minute horizon and carry exactly one market; anything else is a
+    data error and stops the run loudly instead of guessing.
     """
-    if not isinstance(prices, list) or not prices:
-        raise ValueError("market has no prices")
-    last = prices[-1]
-    if not math.isfinite(last) or last <= 0:
-        raise ValueError("last price is not a finite positive number")
-    if len(prices) > HORIZON_MINUTES:
-        ago = prices[-1 - HORIZON_MINUTES]
-        if math.isfinite(ago) and ago > 0:
-            drift = math.log(last / ago)
-            return price5(last * math.exp(-SHRINK * drift))
-    return price5(last)
+    paths = sorted(Path(folder).glob("*.in"))
+    if not paths:
+        raise RuntimeError(f"no .in case files found in {folder}")
+
+    gathered = []
+    for path in paths:
+        with open(path, "r", encoding="utf-8") as handle:
+            case = json.load(handle)
+
+        if case.get("horizon_minutes") != REFERENCE_LAG_MINUTES:
+            raise ValueError(
+                f"{path.name}: horizon_minutes is "
+                f"{case.get('horizon_minutes')}, expected "
+                f"{REFERENCE_LAG_MINUTES}"
+            )
+
+        markets = case.get("markets")
+        if not isinstance(markets, list) or len(markets) != 1:
+            raise ValueError(
+                f"{path.name}: expected exactly one market, found "
+                f"{len(markets) if isinstance(markets, list) else markets!r}"
+            )
+
+        case_id = case.get("case")
+        if not isinstance(case_id, str) or not case_id:
+            raise ValueError(f"{path.name}: missing or empty case id")
+
+        gathered.append((case_id, markets[0].get("prices")))
+    return gathered
+
+
+def project_price(closes):
+    """Forecast the price 240 minutes after the final close.
+
+    When the history is too short to reach 240 minutes back, or the
+    reference close is missing or not a usable positive number, the
+    forecast simply repeats the latest close.
+    """
+    if not closes:
+        raise ValueError("price series is empty")
+
+    latest = float(closes[-1])
+
+    reference = None
+    if len(closes) > REFERENCE_LAG_MINUTES:
+        try:
+            candidate = float(closes[-1 - REFERENCE_LAG_MINUTES])
+        except (TypeError, ValueError):
+            candidate = None
+        if candidate is not None and math.isfinite(candidate) and candidate > 0:
+            reference = candidate
+
+    if reference is None or latest <= 0 or not math.isfinite(latest):
+        guess = latest
+    else:
+        log_move = math.log(latest / reference)
+        guess = latest * math.exp(-REVERSION_FRACTION * log_move)
+
+    guess = round(guess, DECIMAL_PLACES)
+    return min(max(guess, LOWEST_ALLOWED_PRICE), HIGHEST_ALLOWED_PRICE)
 
 
 def main():
-    os.makedirs(OUTPUT_DIR, exist_ok=True)
-    inputs = sorted(f for f in os.listdir(INPUT_DIR) if f.endswith(".in"))
-    if not inputs:
-        raise ValueError("no .in cases found in input directory")
-    for name in inputs:
-        case_id = name[: -len(".in")]
-        with open(os.path.join(INPUT_DIR, name), "r", encoding="utf-8") as fh:
-            case = json.load(fh)
-        markets = case.get("markets")
-        if not isinstance(markets, list) or len(markets) != 1:
-            raise ValueError(f"{name} does not hold exactly one market")
-        if case.get("horizon_minutes", HORIZON_MINUTES) != HORIZON_MINUTES:
-            raise ValueError(f"{name} has an unexpected horizon")
-        guess = forecast(markets[0].get("prices"))
-        out = {"forecasts": [{"case": case_id, "price": guess}]}
-        with open(os.path.join(OUTPUT_DIR, case_id + ".out"), "w", encoding="utf-8") as fh:
-            fh.write(json.dumps(out) + "\n")
+    input_folder = os.environ.get("MAKEFUN_INPUT_DIR", "/input/")
+    output_folder = os.environ.get("MAKEFUN_OUTPUT_DIR", "/output/")
+    Path(output_folder).mkdir(parents=True, exist_ok=True)
+
+    for case_id, closes in pull_cases(input_folder):
+        answer = project_price(closes)
+        payload = {"forecasts": [{"case": case_id, "price": answer}]}
+        out_path = Path(output_folder) / f"{case_id}.out"
+        with open(out_path, "w", encoding="utf-8") as handle:
+            json.dump(payload, handle)
+            handle.write("\n")
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except (OSError, ValueError, RuntimeError) as problem:
+        print(f"error: {problem}", file=sys.stderr)
+        raise SystemExit(1)
